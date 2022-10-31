@@ -3517,6 +3517,24 @@ static struct pci_driver nvme_driver = {
 	.err_handler	= &nvme_err_handler,
 };
 
+int nvme_submit_vf_cmd(struct pci_dev *dev, struct nvme_command *cmd,
+			      size_t *result, void *buffer, unsigned int bufflen)
+{
+	struct nvme_dev *ndev = NULL;
+	union nvme_result res = { };
+	int ret;
+
+	ndev = pci_iov_get_pf_drvdata(dev, &nvme_driver);
+	if (IS_ERR(ndev))
+		return PTR_ERR(ndev);
+	ret = __nvme_submit_sync_cmd(ndev->ctrl.admin_q, cmd, &res, buffer, bufflen,
+			      NVME_QID_ANY, 0, 0);
+	if (ret >= 0 && result)
+		*result = le32_to_cpu(res.u32);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(nvme_submit_vf_cmd);
+
 static int __init nvme_init(void)
 {
 	BUILD_BUG_ON(sizeof(struct nvme_create_cq) != 64);
