@@ -473,6 +473,36 @@ static void nvmevf_pci_close_device(struct vfio_device *core_vdev)
 	vfio_pci_core_close_device(core_vdev);
 }
 
+static bool nvmevf_check_migration(struct pci_dev *pdev)
+{
+	struct nvme_command c = { };
+	struct nvme_id_ctrl *id;
+	u8 live_mig_support;
+	int ret;
+
+	c.identify.opcode = nvme_admin_identify;
+	c.identify.cns = NVME_ID_CNS_CTRL;
+
+	id = kmalloc(sizeof(struct nvme_id_ctrl), GFP_KERNEL);
+	if (!id)
+		return false;
+
+	ret = nvme_submit_vf_cmd(pdev, &c, NULL, id, sizeof(struct nvme_id_ctrl));
+	if (ret) {
+		dev_warn(&pdev->dev, "Get identify ctrl failed (ret=0x%x)\n", ret);
+		goto out;
+	}
+
+	live_mig_support = id->vs[0];
+	if (live_mig_support) {
+		kfree(id);
+		return true;
+	}
+out:
+	kfree(id);
+	return false;
+}
+
 static const struct vfio_migration_ops nvmevf_pci_mig_ops = {
 	.migration_set_state = nvmevf_pci_set_device_state,
 	.migration_get_state = nvmevf_pci_get_device_state,
@@ -487,6 +517,10 @@ static int nvmevf_migration_init_dev(struct vfio_device *core_vdev)
 	int ret = -1;
 
 	if (!pdev->is_virtfn)
+		return ret;
+
+	/* Get the identify controller data structure to check the live migration support */
+	if (!nvmevf_check_migration(pdev))
 		return ret;
 
 	nvmevf_dev->migrate_cap = 1;
