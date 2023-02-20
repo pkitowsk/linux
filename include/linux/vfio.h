@@ -160,6 +160,9 @@ struct vfio_migration_ops {
 				       unsigned long *stop_copy_length);
 };
 
+void vfio_combine_ranges(struct rb_root_cached *root, u32 cur_nodes,
+						u32 req_nodes);
+
 /**
  * @log_start: Optional callback to ask the device start DMA logging.
  * @log_stop: Optional callback to ask the device stop DMA logging.
