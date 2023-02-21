@@ -473,11 +473,10 @@ static void nvmevf_pci_close_device(struct vfio_device *core_vdev)
 	vfio_pci_core_close_device(core_vdev);
 }
 
-static bool nvmevf_check_migration(struct pci_dev *pdev)
+static unsigned int nvmevf_cap_get(struct pci_dev *pdev, struct nvmevf_cap *nvmevf_cap)
 {
 	struct nvme_command c = { };
 	struct nvme_id_ctrl *id;
-	u8 live_mig_support;
 	int ret;
 
 	c.identify.opcode = nvme_admin_identify;
@@ -485,22 +484,19 @@ static bool nvmevf_check_migration(struct pci_dev *pdev)
 
 	id = kmalloc(sizeof(struct nvme_id_ctrl), GFP_KERNEL);
 	if (!id)
-		return false;
+		return -ENOMEM;
 
 	ret = nvme_submit_vf_cmd(pdev, &c, NULL, id, sizeof(struct nvme_id_ctrl));
 	if (ret) {
 		dev_warn(&pdev->dev, "Get identify ctrl failed (ret=0x%x)\n", ret);
-		goto out;
+		goto out_free;
 	}
+	nvmevf_cap->migrate_cap = id->vs[0];
+	nvmevf_cap->log_ranges_max = id->vs[1];
 
-	live_mig_support = id->vs[0];
-	if (live_mig_support) {
-		kfree(id);
-		return true;
-	}
-out:
+out_free:
 	kfree(id);
-	return false;
+	return ret;
 }
 
 static const struct vfio_migration_ops nvmevf_pci_mig_ops = {
@@ -508,22 +504,31 @@ static const struct vfio_migration_ops nvmevf_pci_mig_ops = {
 	.migration_get_state = nvmevf_pci_get_device_state,
 };
 
+static const struct vfio_log_ops nvmevf_pci_log_ops = {
+};
+
 static int nvmevf_migration_init_dev(struct vfio_device *core_vdev)
 {
 	struct nvmevf_pci_core_device *nvmevf_dev = container_of(core_vdev,
 					struct nvmevf_pci_core_device, core_device.vdev);
 	struct pci_dev *pdev = to_pci_dev(core_vdev->dev);
-	int vf_id;
-	int ret = -1;
+	struct nvmevf_cap nvmevf_cap;
+	int vf_id, ret = -1;
 
 	if (!pdev->is_virtfn)
 		return ret;
 
 	/* Get the identify controller data structure to check the live migration support */
-	if (!nvmevf_check_migration(pdev))
+	ret = nvmevf_cap_get(pdev, &nvmevf_cap);
+	if (ret)
 		return ret;
 
-	nvmevf_dev->migrate_cap = 1;
+	ret = -1;
+	nvmevf_dev->migrate_cap = nvmevf_cap.migrate_cap ? true : false;
+	if (!nvmevf_dev->migrate_cap)
+		return ret;
+
+	nvmevf_dev->log_ranges_max = nvmevf_cap.log_ranges_max;
 
 	vf_id = pci_iov_vf_id(pdev);
 	if (vf_id < 0)
@@ -531,9 +536,13 @@ static int nvmevf_migration_init_dev(struct vfio_device *core_vdev)
 	nvmevf_dev->vf_id = vf_id + 1;
 	core_vdev->migration_flags = VFIO_MIGRATION_STOP_COPY;
 
+	if (nvmevf_dev->migrate_cap)
+		core_vdev->mig_ops = &nvmevf_pci_mig_ops;
+	if (nvmevf_dev->log_ranges_max)
+		core_vdev->log_ops = &nvmevf_pci_log_ops;
+
 	mutex_init(&nvmevf_dev->state_mutex);
 	spin_lock_init(&nvmevf_dev->reset_lock);
-	core_vdev->mig_ops = &nvmevf_pci_mig_ops;
 
 	return vfio_pci_core_init_dev(core_vdev);
 }

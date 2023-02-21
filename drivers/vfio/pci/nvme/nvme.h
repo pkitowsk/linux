@@ -96,6 +96,8 @@ struct nvmevf_pci_core_device {
 	int vf_id;
 	u8 migrate_cap:1;
 	u8 deferred_reset:1;
+	u8 log_active:1;
+	u8 log_ranges_max;
 	/* protect migration state */
 	struct mutex state_mutex;
 	enum vfio_device_mig_state mig_state;
@@ -103,6 +105,11 @@ struct nvmevf_pci_core_device {
 	spinlock_t reset_lock;
 	struct nvmevf_migration_file *resuming_migf;
 	struct nvmevf_migration_file *saving_migf;
+};
+
+struct nvmevf_cap {
+	u8 migrate_cap;
+	u8 log_ranges_max;
 };
 
 extern int nvme_submit_vf_cmd(struct pci_dev *dev, struct nvme_command *cmd,
