@@ -65,12 +65,52 @@ struct nvme_live_mig_load_data {
 	__u32   rsvd3[4];
 };
 
+struct nvme_live_mig_log_start {
+	__u8    opcode;
+	__u8    flags;
+	__u16   command_id;
+	__u32   rsvd1[5];
+	__le64  prp1;
+	__le64  prp2;
+	__le16  vf_index;
+	__u16   rsvd10;
+	__le32  size;
+	__u32   rsvd12[4];
+};
+
+struct nvme_live_mig_log_stop {
+	__u8    opcode;
+	__u8    flags;
+	__u16   command_id;
+	__u32   rsvd1[9];
+	__le16  vf_index;
+	__u16   rsvd10;
+	__u32   rsvd11[5];
+};
+
+struct nvme_live_mig_log_report {
+	__u8    opcode;
+	__u8    flags;
+	__u16   command_id;
+	__u32   rsvd1[5];
+	__le64  prp1;
+	__le64  prp2;
+	__le16  vf_index;
+	__u16   rsvd10;
+	__u32   rsvd11;
+	__le64  iova;
+	__le64  length;
+};
+
 enum nvme_live_mig_admin_opcode {
 	nvme_admin_live_mig_query_data_size	= 0xC4,
 	nvme_admin_live_mig_suspend		= 0xC8,
 	nvme_admin_live_mig_resume		= 0xCC,
 	nvme_admin_live_mig_save_data		= 0xD2,
 	nvme_admin_live_mig_load_data		= 0xD5,
+	nvme_admin_live_mig_log_start       = 0xD9,
+	nvme_admin_live_mig_log_stop        = 0xDC,
+	nvme_admin_live_mig_log_report      = 0xE2,
 };
 
 struct nvme_live_mig_command {
@@ -80,6 +120,9 @@ struct nvme_live_mig_command {
 		struct nvme_live_mig_resume	resume;
 		struct nvme_live_mig_save_data	save;
 		struct nvme_live_mig_load_data	load;
+		struct nvme_live_mig_log_start log_start;
+		struct nvme_live_mig_log_stop log_stop;
+		struct nvme_live_mig_log_report log_report;
 	};
 };
 
@@ -98,6 +141,7 @@ struct nvmevf_pci_core_device {
 	u8 deferred_reset:1;
 	u8 log_active:1;
 	u8 log_ranges_max;
+	u64 log_page_size;
 	/* protect migration state */
 	struct mutex state_mutex;
 	enum vfio_device_mig_state mig_state;
@@ -110,6 +154,17 @@ struct nvmevf_pci_core_device {
 struct nvmevf_cap {
 	u8 migrate_cap;
 	u8 log_ranges_max;
+};
+
+struct iova_range {
+	u64 iova_start;
+	u64 length;
+};
+
+struct iova_ranges {
+	u64 page_size;
+	u32 count;
+	struct iova_range ranges[];
 };
 
 extern int nvme_submit_vf_cmd(struct pci_dev *dev, struct nvme_command *cmd,

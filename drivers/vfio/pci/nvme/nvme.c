@@ -13,6 +13,7 @@
 #include <linux/types.h>
 #include <linux/vfio.h>
 #include <linux/anon_inodes.h>
+#include <linux/interval_tree.h>
 
 #include "nvme.h"
 
@@ -499,12 +500,171 @@ out_free:
 	return ret;
 }
 
+static int nvmevf_pci_log_start(struct vfio_device *vdev,
+						struct rb_root_cached *ranges, u32 nnodes,
+						u64 *page_size)
+{
+	struct nvme_live_mig_command c = { };
+	struct nvmevf_pci_core_device *nvmevf_dev = container_of(
+					vdev, struct nvmevf_pci_core_device, core_device.vdev);
+	struct pci_dev *dev = nvmevf_dev->core_device.pdev;
+	struct iova_ranges *iova_ranges;
+	struct interval_tree_node *node = NULL;
+	u32 range_count, ranges_size, i;
+	int ret = 0;
+
+	range_count = nvmevf_dev->log_ranges_max;
+	if (range_count < nnodes)
+		vfio_combine_ranges(ranges, nnodes, range_count);
+	else
+		range_count = nnodes;
+
+	ranges_size = offsetofend(struct iova_ranges, page_size)
+						+ range_count * sizeof(struct iova_range);
+	iova_ranges = kvzalloc(ranges_size, GFP_KERNEL);
+	if (iova_ranges == NULL)
+		return -ENOMEM;
+
+	iova_ranges->count = cpu_to_le32(range_count);
+	iova_ranges->page_size = cpu_to_le64(*page_size);
+
+	node = interval_tree_iter_first(ranges, 0, ULONG_MAX);
+	for (i = 0; i < range_count; i++) {
+		iova_ranges->ranges[i].iova_start = cpu_to_le64(node->start);
+		iova_ranges->ranges[i].length = cpu_to_le64(node->last - node->start + 1);
+		node = interval_tree_iter_next(node, 0, ULONG_MAX);
+	}
+
+	c.log_start.opcode = nvme_admin_live_mig_log_start;
+	c.log_start.vf_index = cpu_to_le16(nvmevf_dev->vf_id);
+	c.log_start.size = cpu_to_le32(ranges_size);
+
+	ret = nvme_submit_vf_cmd(dev, (struct nvme_command *)&c, NULL, iova_ranges, ranges_size);
+	if (ret) {
+		dev_warn(&dev->dev, "DMA logging start failed (ret=0x%x)\n", ret);
+		goto out_free;
+	}
+
+	nvmevf_dev->log_page_size = *page_size;
+	nvmevf_dev->log_active = true;
+
+out_free:
+	kvfree(iova_ranges);
+	return ret;
+}
+
+static void fill_iova_bitmap(struct iova_bitmap *dirty, unsigned char *bitmap,
+						u32 bitmap_len, u64 iova, u64 length, u32 page_size)
+{
+	u64 byte_i, bits_valid, count;
+	u64 iova_down, addr;
+	u8 bits_offset, bit_i;
+
+	bits_offset = DIV_ROUND_UP((iova - ALIGN_DOWN(iova, page_size * BITS_PER_BYTE)), page_size);
+	bits_valid = (ALIGN(iova + length, page_size) - ALIGN_DOWN(iova, page_size))/page_size;
+	iova_down = ALIGN_DOWN(iova, page_size);
+
+	for (byte_i = 0, count = 0; byte_i < bitmap_len; byte_i++) {
+		for (bit_i = 0; bit_i < BITS_PER_BYTE; bit_i++) {
+			if (unlikely(byte_i == 0 && bit_i < bits_offset))
+				continue;
+			if (unlikely(count >= bits_valid))
+				break;
+			if (bitmap[byte_i] & BIT(bit_i)) {
+				addr = iova_down + count * page_size;
+				iova_bitmap_set(dirty, addr, page_size);
+			}
+			count++;
+		}
+	}
+}
+
+static int nvmevf_pci_log_read_and_clear(struct vfio_device *vdev,
+							unsigned long iova, unsigned long length,
+							struct iova_bitmap *dirty)
+{
+	struct nvme_live_mig_command c = { };
+	struct nvmevf_pci_core_device *nvmevf_dev = container_of(
+					vdev, struct nvmevf_pci_core_device, core_device.vdev);
+	struct pci_dev *dev = nvmevf_dev->core_device.pdev;
+	unsigned int bitmap_len, buffer_len, offset, times;
+	unsigned char *bitmap;
+	u64 page_size = nvmevf_dev->log_page_size;
+	u64 iova_up, iova_down, iova_curr, len_curr;
+	int ret = 0;
+
+	/* Should grab it from nvmevf_dev */
+	unsigned int mdts = SZ_128K;
+
+	iova_down = ALIGN_DOWN(iova, page_size * BITS_PER_BYTE);
+	iova_up = ALIGN(iova + length, page_size * BITS_PER_BYTE);
+
+	bitmap_len = (iova_up - iova_down) / (page_size * BITS_PER_BYTE);
+	bitmap = kvzalloc(bitmap_len, GFP_KERNEL);
+	if (bitmap == NULL)
+		return -ENOMEM;
+
+	c.log_report.opcode = nvme_admin_live_mig_log_report;
+	c.log_report.vf_index = cpu_to_le16(nvmevf_dev->vf_id);
+
+	times = DIV_ROUND_UP(bitmap_len, mdts);
+	for (; times > 0; times--, offset += mdts) {
+		if (times == 1 && bitmap_len % mdts)
+			buffer_len = bitmap_len % mdts;
+		else
+			buffer_len = mdts;
+
+		iova_curr = iova_down + offset * BITS_PER_BYTE * page_size;
+		len_curr = buffer_len * BITS_PER_BYTE * page_size;
+		c.log_report.iova = cpu_to_le64(iova_curr);
+		c.log_report.length = cpu_to_le64(len_curr);
+
+		ret = nvme_submit_vf_cmd(dev, (struct nvme_command *)&c, NULL, bitmap + offset,
+								buffer_len);
+		if (ret) {
+			dev_warn(&dev->dev, "DMA logging report failed (ret=0x%x)\n", ret);
+			goto out_free;
+		}
+	}
+
+	/* Sync dirty bitmap received into iova_bitmap */
+	fill_iova_bitmap(dirty, bitmap, bitmap_len, iova, length, page_size);
+
+out_free:
+	kvfree(bitmap);
+	return ret;
+}
+
+static int nvmevf_pci_log_stop(struct vfio_device *vdev)
+{
+	struct nvme_live_mig_command c = { };
+	struct nvmevf_pci_core_device *nvmevf_dev = container_of(
+					vdev, struct nvmevf_pci_core_device, core_device.vdev);
+	struct pci_dev *dev = nvmevf_dev->core_device.pdev;
+	int ret = 0;
+
+	c.log_stop.opcode = nvme_admin_live_mig_log_stop;
+	c.log_stop.vf_index = cpu_to_le16(nvmevf_dev->vf_id);
+
+	ret = nvme_submit_vf_cmd(dev, (struct nvme_command *)&c, NULL, NULL, 0);
+	if (ret) {
+		dev_warn(&dev->dev, "DMA logging stop failed (ret=0x%x)\n", ret);
+		return ret;
+	}
+
+	nvmevf_dev->log_active = false;
+	return ret;
+}
+
 static const struct vfio_migration_ops nvmevf_pci_mig_ops = {
 	.migration_set_state = nvmevf_pci_set_device_state,
 	.migration_get_state = nvmevf_pci_get_device_state,
 };
 
 static const struct vfio_log_ops nvmevf_pci_log_ops = {
+	.log_start = nvmevf_pci_log_start,
+	.log_stop = nvmevf_pci_log_stop,
+	.log_read_and_clear = nvmevf_pci_log_read_and_clear,
 };
 
 static int nvmevf_migration_init_dev(struct vfio_device *core_vdev)
