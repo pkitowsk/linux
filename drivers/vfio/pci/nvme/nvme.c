@@ -656,9 +656,25 @@ static int nvmevf_pci_log_stop(struct vfio_device *vdev)
 	return ret;
 }
 
+static int nvmevf_pci_get_data_size(struct vfio_device *core_vdev,unsigned long *stop_copy_length) 
+{ 
+	struct nvmevf_pci_core_device *nvmevf_dev = container_of(
+		core_vdev, struct nvmevf_pci_core_device, core_device.vdev);
+	size_t state_size; 
+	int ret; 
+
+	mutex_lock(&nvmevf_dev->state_mutex); 
+	ret = nvmevf_cmd_query_data_size(nvmevf_dev, &state_size); 
+	if (!ret) 
+		*stop_copy_length = state_size; 
+	nvmevf_state_mutex_unlock(nvmevf_dev); 
+	return ret; 
+} 
+
 static const struct vfio_migration_ops nvmevf_pci_mig_ops = {
 	.migration_set_state = nvmevf_pci_set_device_state,
 	.migration_get_state = nvmevf_pci_get_device_state,
+	.migration_get_data_size = nvmevf_pci_get_data_size, 
 };
 
 static const struct vfio_log_ops nvmevf_pci_log_ops = {
